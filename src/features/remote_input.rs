@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 pub(crate) mod polling;
 mod recovery;
 pub(crate) use recovery::{InputRecovery, InputWork};
+mod macos;
 
 const MAX_EVENTS: usize = 512;
 const MOTION_JITTER: Duration = Duration::from_micros(100);
@@ -99,7 +100,10 @@ pub(crate) enum InputEvent {
         horizontal: bool,
     },
     Key {
+        /// Windows virtual key, the form the local adapters produce.
         key: u16,
+        /// The target platform, which decides the wire key space.
+        platform: i32,
         down: bool,
         lock: Option<u8>,
         interrupt: bool,
@@ -149,12 +153,25 @@ impl InputEvent {
                 "delta_y":if horizontal {0} else {delta} }),
             Self::Key {
                 key,
+                platform,
                 down,
                 lock,
                 interrupt,
             } => {
+                // The wire carries one integer per keystroke, read in the
+                // host's own key space: Windows wants the virtual key we hold,
+                // macOS wants its key code. Translate at the last moment so the
+                // local key tracking stays in virtual keys throughout.
+                let wire = match platform {
+                    PLATFORM_MACOS => macos::from_virtual_key(key).unwrap_or(key),
+                    _ => key,
+                };
+                if platform == PLATFORM_MACOS && wire != key {
+                    tracing::debug!(target: "openuuyc::transport::rtc::input",
+                        vk = key, key_code = wire, down, "translated key for macOS host");
+                }
                 let mut value = serde_json::json!({
-                    "action": if down { "kbd_press" } else { "kbd_release" }, "key": key
+                    "action": if down { "kbd_press" } else { "kbd_release" }, "key": wire
                 });
                 if interrupt {
                     value["interrept"] = "i".into();
@@ -366,6 +383,7 @@ impl RemoteInput {
         // to transport. The entire finite sequence enters the same queue/epoch.
         Self::release_locked(&mut s);
         s.owner = Some(owner);
+        let platform = s.keyboard_platform;
         for (key, down) in [
             (162, true),
             (164, true),
@@ -376,6 +394,7 @@ impl RemoteInput {
         ] {
             s.queue.push_back(InputEvent::Key {
                 key,
+                platform,
                 down,
                 lock: None,
                 // A finite menu command has no physical key/heartbeat owner.
@@ -399,6 +418,12 @@ impl RemoteInput {
         if !accepts_keyboard(s.keyboard_platform) {
             return false;
         }
+        // A macOS host reads the number as its own key code. Keys the host
+        // table does not name are dropped up front rather than sent as a
+        // virtual key, which would land on an unrelated character.
+        if s.keyboard_platform == PLATFORM_MACOS && macos::from_virtual_key(key).is_none() {
+            return false;
+        }
         if down {
             if !Self::claim(&mut s, owner) {
                 return false;
@@ -407,10 +432,12 @@ impl RemoteInput {
             return false;
         }
         let lock = lock.filter(|v| matches!(key, 20 | 144 | 145) && matches!(v, 0 | 128));
+        let platform = s.keyboard_platform;
         let accepted = Self::push(
             &mut s,
             InputEvent::Key {
                 key,
+                platform,
                 down,
                 lock,
                 interrupt: true,
@@ -601,11 +628,13 @@ impl RemoteInput {
         s.keyboard_generation = s.keyboard_generation.wrapping_add(1);
         s.release_checkpoint.extend(s.remote_keys.keys().copied());
         // Release ordinary keys before modifiers; never synthesize new downs.
+        let platform = s.keyboard_platform;
         for modifier in [false, true] {
             for &key in s.remote_keys.keys() {
                 if matches!(key, 16..=18 | 91..=92 | 160..=165) == modifier {
                     s.queue.push_back(InputEvent::Key {
                         key,
+                        platform,
                         down: false,
                         lock: None,
                         interrupt: false,
@@ -642,11 +671,13 @@ impl RemoteInput {
                 s.keyboard_generation = s.keyboard_generation.wrapping_add(1);
                 let keys: Vec<_> = s.remote_keys.keys().copied().collect();
                 s.release_checkpoint.extend(keys.iter().copied());
+                let platform = s.keyboard_platform;
                 for modifier in [false, true] {
                     for &key in &keys {
                         if matches!(key,16..=18|91..=92|160..=165) == modifier {
                             s.queue.push_back(InputEvent::Key {
                                 key,
+                                platform,
                                 down: false,
                                 lock: None,
                                 interrupt: false,
@@ -715,10 +746,11 @@ impl RemoteInput {
         let mut s = self.lock();
         let retired = std::mem::take(&mut s.release_checkpoint);
         if s.ready {
+            let platform = s.keyboard_platform;
             for key in retired {
                 if !s.queue.iter().any(|event| matches!(event, InputEvent::Key { key: queued, down: false, .. } if *queued == key)) {
                     s.remote_keys.entry(key).or_insert(None);
-                    s.queue.push_back(InputEvent::Key { key, down: false, lock: None, interrupt: false });
+                    s.queue.push_back(InputEvent::Key { key, platform, down: false, lock: None, interrupt: false });
                 }
             }
         } else {

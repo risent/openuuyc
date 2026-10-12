@@ -489,9 +489,12 @@ pub(super) async fn send_remote_input(
             )
         {
             keyboard_submission_seen = true;
-            tracing::debug!(target: "openuuyc::transport::rtc::input",
-                down = matches!(event.event, crate::features::remote_input::InputEvent::Key { down: true, .. }),
-                "keyboard event submitted to CONTROL transport");
+            if let crate::features::remote_input::InputEvent::Key { key, down, .. } =
+                event.event
+            {
+                tracing::debug!(target: "openuuyc::transport::rtc::input",
+                    key, down, "keyboard event submitted to CONTROL transport");
+            }
         }
         mouse.complete(&event, result);
     }
