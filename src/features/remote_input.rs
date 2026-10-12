@@ -14,6 +14,20 @@ const MAX_EVENTS: usize = 512;
 const MOTION_JITTER: Duration = Duration::from_micros(100);
 pub(crate) const BUTTONS: [u32; 5] = [1, 2, 16, 32, 64];
 
+/// Account platform codes for the hosts whose input accepts this client's keys.
+const PLATFORM_WINDOWS: i32 = 1;
+const PLATFORM_MACOS: i32 = 4;
+
+/// Whether the host on `platform` decodes the Windows virtual-key codes this
+/// client sends.
+///
+/// The wire format is Windows VKs for every host; the macOS host maps them to
+/// its own key codes internally, which is why the official client sends the
+/// same codes to both. Rejecting macOS here silently dropped every keystroke.
+const fn accepts_keyboard(platform: i32) -> bool {
+    matches!(platform, PLATFORM_WINDOWS | PLATFORM_MACOS)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum MouseThrottleRate {
     #[serde(rename = "125")]
@@ -327,8 +341,16 @@ impl RemoteInput {
         }
     }
 
+    /// Whether this target accepts the Windows virtual-key codes this client
+    /// sends. Both Windows and macOS hosts do: the macOS host maps the codes to
+    /// its own key codes internally, exactly as the official client relies on.
     pub fn keyboard_supported(&self) -> bool {
-        self.lock().keyboard_platform == 1
+        accepts_keyboard(self.lock().keyboard_platform)
+    }
+
+    /// Whether Ctrl+Alt+Del is meaningful here, which is Windows only.
+    pub fn supports_ctrl_alt_del(&self) -> bool {
+        self.lock().keyboard_platform == PLATFORM_WINDOWS
     }
 
     /// Explicit viewer command, never injected into the local Windows desktop.
@@ -367,14 +389,14 @@ impl RemoteInput {
         Ok(())
     }
 
-    /// Native adapters supply Windows VKs only for a verified Windows peer.
-    /// Other target encodings are separate adapters, never a cast of local keys.
+    /// Native adapters supply Windows VKs for the platforms whose hosts accept
+    /// them; anything else must not receive a cast of local keys.
     pub fn key(&self, owner: u64, key: u16, down: bool, lock: Option<u8>) -> bool {
         if !(1..=254).contains(&key) {
             return false;
         }
         let mut s = self.lock();
-        if s.keyboard_platform != 1 {
+        if !accepts_keyboard(s.keyboard_platform) {
             return false;
         }
         if down {
