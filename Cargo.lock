@@ -3686,6 +3686,7 @@ dependencies = [
  "windows",
  "windows-core",
  "winit",
+ "wl-clipboard-rs",
  "x11rb",
  "yuv",
  "zbus",
