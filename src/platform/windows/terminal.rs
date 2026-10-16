@@ -13,7 +13,7 @@
 use anyhow::{Context, Result, bail};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
@@ -185,6 +185,10 @@ impl Session {
         if waited == WAIT_OBJECT_0 {
             return true;
         }
+        // A bad handle must not look like a live shell.
+        if waited == WAIT_FAILED {
+            return true;
+        }
         let mut code = 0u32;
         // SAFETY: as above, with a live out-parameter.
         matches!(
@@ -239,7 +243,10 @@ fn spawn(shell: &str, console: HPCON) -> Result<HANDLE> {
             list,
             0,
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-            Some(std::ptr::from_ref(&console).cast()),
+            // The attribute takes the `HPCON` *value*: the API stores the
+            // pointer itself, so passing its address hands the console a
+            // bogus handle and the child starts with no pseudoconsole at all.
+            Some(console.0 as *const core::ffi::c_void),
             std::mem::size_of::<HPCON>(),
             None,
             None,
