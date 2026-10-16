@@ -338,3 +338,69 @@ fn write_input(handle: SendHandle, input: Receiver<Vec<u8>>) {
         let _ = CloseHandle(handle);
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// `cmd.exe` is present on every Windows install.
+    fn shell() -> &'static str {
+        "cmd.exe"
+    }
+
+    /// Collects output until `needle` shows up or `timeout` passes.
+    fn read_until(session: &mut Session, needle: &str, timeout: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        let mut seen = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while Instant::now() < deadline {
+            match session.read(&mut buffer) {
+                Ok(Some(0)) => break,
+                Ok(Some(read)) => seen.extend_from_slice(&buffer[..read]),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("read: {error}"),
+            }
+            if String::from_utf8_lossy(&seen).contains(needle) {
+                break;
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn a_shell_round_trips_through_the_pseudo_console() {
+        let mut session = Session::open(shell(), 80, 24).expect("open");
+        session.write(b"echo ROUND-TRIP-OK\r\n").expect("write");
+        let seen = read_until(&mut session, "ROUND-TRIP-OK", Duration::from_secs(20));
+        assert!(
+            String::from_utf8_lossy(&seen).contains("ROUND-TRIP-OK"),
+            "shell produced: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        // The controller's size must reach the console without error.
+        session.resize(100, 40).expect("resize");
+    }
+
+    #[test]
+    fn an_exited_shell_is_reported() {
+        let mut session = Session::open(shell(), 80, 24).expect("open");
+        session.write(b"exit\r\n").expect("write");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if session.exited() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("shell did not exit");
+    }
+
+    #[test]
+    fn every_shell_kind_resolves_to_something() {
+        for kind in ["powershell", "cmd", "bash", "", "nonsense"] {
+            assert!(!resolve_shell(kind).is_empty(), "{kind:?}");
+        }
+        assert!(!default_shell().is_empty());
+    }
+}
