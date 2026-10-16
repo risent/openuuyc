@@ -13,7 +13,7 @@
 use anyhow::{Context, Result, bail};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
@@ -49,6 +49,14 @@ pub(crate) fn resolve_shell(requested: &str) -> String {
 pub(crate) fn default_shell() -> String {
     std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_owned())
 }
+
+/// A handle handed to a worker thread.
+///
+/// [`HANDLE`] wraps a raw pointer and so is not `Send`; ownership is moved to
+/// exactly one thread, which is all these threads need.
+struct SendHandle(HANDLE);
+// SAFETY: the handle is owned by the thread it moves to and never shared.
+unsafe impl Send for SendHandle {}
 
 /// A shell running on a pseudo console.
 pub(crate) struct Session {
@@ -106,8 +114,11 @@ impl Session {
         };
 
         let (output_tx, output_rx) = sync_channel(64);
+        // Wrap before the closure so the thread gets a `Send` value.
+        let output_read = SendHandle(output_read);
         std::thread::spawn(move || read_output(output_read, output_tx));
         let (input_tx, input_rx) = sync_channel(64);
+        let input_write = SendHandle(input_write);
         std::thread::spawn(move || write_input(input_write, input_rx));
 
         Ok(Self {
@@ -217,11 +228,11 @@ fn spawn(shell: &str, console: HPCON) -> Result<HANDLE> {
     let mut size = 0usize;
     // SAFETY: a null list with a zero count only reports the size, which is
     // the documented way to size it.
-    let _ = unsafe { InitializeProcThreadAttributeList(None, 1, 0, &mut size) };
+    let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
     let mut storage = vec![0u8; size];
     let list = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
     // SAFETY: `storage` is at least `size` bytes, as the call above reported.
-    unsafe { InitializeProcThreadAttributeList(Some(list), 1, 0, &mut size) }
+    unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
         .context("初始化进程属性失败")?;
     let attribute = unsafe {
         UpdateProcThreadAttribute(
@@ -268,12 +279,15 @@ fn spawn(shell: &str, console: HPCON) -> Result<HANDLE> {
 
     // The thread handle is not needed; the process handle is.
     // SAFETY: the thread handle came back from `CreateProcessW` and is ours.
-    unsafe { CloseHandle(process.hThread) };
+    unsafe {
+        let _ = CloseHandle(process.hThread);
+    };
     Ok(process.hProcess)
 }
 
 /// Reads the console's output into `out` until it closes.
-fn read_output(handle: HANDLE, out: SyncSender<Vec<u8>>) {
+fn read_output(handle: SendHandle, out: SyncSender<Vec<u8>>) {
+    let handle = handle.0;
     let mut buffer = [0u8; 8192];
     loop {
         let mut read = 0u32;
@@ -282,9 +296,8 @@ fn read_output(handle: HANDLE, out: SyncSender<Vec<u8>>) {
         let ok = unsafe {
             ReadFile(
                 handle,
-                Some(buffer.as_mut_ptr().cast()),
-                buffer.len() as u32,
-                Some(&mut read),
+                Some(&mut buffer),
+                Some(std::ptr::from_mut(&mut read)),
                 None,
             )
         };
@@ -297,20 +310,22 @@ fn read_output(handle: HANDLE, out: SyncSender<Vec<u8>>) {
         }
     }
     // SAFETY: the read end is ours and is not used again.
-    unsafe { CloseHandle(handle) };
+    unsafe {
+        let _ = CloseHandle(handle);
+    };
 }
 
 /// Writes queued input to the console until the channel closes.
-fn write_input(handle: HANDLE, input: Receiver<Vec<u8>>) {
+fn write_input(handle: SendHandle, input: Receiver<Vec<u8>>) {
+    let handle = handle.0;
     while let Ok(data) = input.recv() {
         let mut written = 0u32;
         // SAFETY: the handle is live and the slice is valid for reads.
         let ok = unsafe {
             WriteFile(
                 handle,
-                Some(data.as_ptr().cast()),
-                data.len() as u32,
-                Some(&mut written),
+                Some(&data),
+                Some(std::ptr::from_mut(&mut written)),
                 None,
             )
         };
@@ -319,5 +334,7 @@ fn write_input(handle: HANDLE, input: Receiver<Vec<u8>>) {
         }
     }
     // SAFETY: the write end is ours and is not used again.
-    unsafe { CloseHandle(handle) };
+    unsafe {
+        let _ = CloseHandle(handle);
+    };
 }
