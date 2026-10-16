@@ -5,5 +5,5 @@ pub(crate) mod windows;
 #[cfg(windows)]
 pub(crate) use windows::{
     capture, decoder, display, display_hdr, encoder, graphics, host_service, surface, swapchain,
-    transfer, video_shader,
+    terminal, transfer, video_shader,
 };
